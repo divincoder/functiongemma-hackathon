@@ -276,7 +276,7 @@ def _is_multi_action(text):
     return " and " in lower or lower.count(",") > 1
 
 
-def generate_hybrid(messages, tools, confidence_threshold=0.6):
+def generate_hybrid(messages, tools, confidence_threshold=0.7):
     """Hybrid inference: on-device with structural validation, cloud fallback."""
     start = time.time()
     user_text = " ".join(m["content"] for m in messages if m["role"] == "user")
@@ -334,7 +334,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.6):
     result = _on_device_call(messages, tools, tool_rag_top_k=None)
     _fix_args(result["function_calls"], tools)
 
-    if result["function_calls"] and _valid_calls(result["function_calls"], tools) and _has_all_required(result["function_calls"], tools):
+    if result["function_calls"] and _valid_calls(result["function_calls"], tools):
         return {
             "function_calls": result["function_calls"],
             "total_time_ms": (time.time() - start) * 1000,
@@ -349,6 +349,22 @@ def generate_hybrid(messages, tools, confidence_threshold=0.6):
         cloud["total_time_ms"] = (time.time() - start) * 1000
         cloud["local_confidence"] = result.get("confidence", 0)
         return cloud
+
+    # Narrowed retry for ambiguous single-intent tool choice
+    narrowed_retry = _on_device_call(
+        messages,
+        tools,
+        tool_rag_top_k=min(2, len(tools)),
+        extra_system="Select the single best tool and return one valid function call with all required arguments. No prose.",
+        temperature=0.35,
+    )
+    _fix_args(narrowed_retry["function_calls"], tools)
+    if narrowed_retry["function_calls"] and _valid_calls(narrowed_retry["function_calls"], tools):
+        return {
+            "function_calls": narrowed_retry["function_calls"],
+            "total_time_ms": (time.time() - start) * 1000,
+            "source": "on-device",
+        }
 
     if result.get("confidence", 0) >= confidence_threshold:
         retry = _on_device_call(
@@ -371,13 +387,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.6):
     cloud["source"] = "cloud (fallback)"
     cloud["total_time_ms"] = (time.time() - start) * 1000
     cloud["local_confidence"] = result.get("confidence", 0)
-    return cloud
-    # Cloud fallback
-    cloud = generate_cloud(messages, tools)
-    _fix_args(cloud["function_calls"], tools)
-    cloud["source"] = "cloud (fallback)"
-    cloud["total_time_ms"] = (time.time() - start) * 1000
-    cloud["local_confidence"] = result.get("confidence", 0)
+
     return cloud
 
 
