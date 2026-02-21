@@ -67,15 +67,7 @@ def generate_cloud(messages, tools):
         ])
     ]
 
-    # Preserve full conversation (system + history) for better tool grounding.
-    contents = [
-        types.Content(role=m["role"], parts=[types.Part(text=m["content"])])
-        for m in messages
-    ]
-    # Add steering hint to encourage completeness and format (Gemini expects roles user/model).
-    contents.insert(0, types.Content(role="user", parts=[types.Part(
-        text="Instruction: Return function_calls array with one entry per requested action. Use only provided tools. No prose."
-    )]))
+    contents = [m["content"] for m in messages if m["role"] == "user"]
 
     start_time = time.time()
 
