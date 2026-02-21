@@ -47,6 +47,14 @@ def generate_cactus(messages, tools):
 
 def generate_cloud(messages, tools):
     """Run function calling via Gemini Cloud API."""
+    if os.environ.get("CACTUS_OFFLINE") == "1":
+        # Simulate cloud unavailability for offline demos.
+        return {
+            "function_calls": [],
+            "total_time_ms": 0,
+            "cloud_blocked": True,
+            "source": "cloud-blocked",
+        }
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
     gemini_tools = [
@@ -68,10 +76,12 @@ def generate_cloud(messages, tools):
     ]
 
     # Preserve full conversation (system + history) for better tool grounding.
-    contents = [
-        types.Content(role=m["role"], parts=[types.Part(text=m["content"])])
-        for m in messages
-    ]
+    contents = []
+    for m in messages:
+        role = m.get("role", "user")
+        if role not in ("user", "model"):
+            role = "user"
+        contents.append(types.Content(role=role, parts=[types.Part(text=m["content"])]))
     # Add steering hint to encourage completeness and format (Gemini expects roles user/model).
     contents.insert(0, types.Content(role="user", parts=[types.Part(
         text="Instruction: Return function_calls array with one entry per requested action. Use only provided tools. No prose."
