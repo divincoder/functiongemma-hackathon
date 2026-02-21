@@ -1,12 +1,12 @@
-
+import time
+import os
+import json
+from google.genai import types
+from google import genai
+from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
 import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
-
-import json, os, time
-from cactus import cactus_init, cactus_complete, cactus_destroy
-from google import genai
-from google.genai import types
 
 
 def generate_cactus(messages, tools):
@@ -57,7 +57,8 @@ def generate_cloud(messages, tools):
                 parameters=types.Schema(
                     type="OBJECT",
                     properties={
-                        k: types.Schema(type=v["type"].upper(), description=v.get("description", ""))
+                        k: types.Schema(type=v["type"].upper(
+                        ), description=v.get("description", ""))
                         for k, v in t["parameters"]["properties"].items()
                     },
                     required=t["parameters"].get("required", []),
@@ -94,40 +95,142 @@ def generate_cloud(messages, tools):
     }
 
 
+# def generate_hybrid(messages, tools, confidence_threshold=0.99):
+
+#     # cache the local mode
+#     if not hasattr(generate_hybrid, "_model"):
+#         generate_hybrid._model = cactus_init(functiongemma_path)
+
+#     model = generate_hybrid._model
+
+#     cactus_tools = [{"type": "function", "function": t} for t in tools]
+
+#     raw_str = cactus_complete(
+#         model,
+#         [{"role": "system", "content": "You are a helpful assistant that can use tools."}] + messages,
+#         tools=cactus_tools,
+#         force_tools=True,
+#         max_tokens=256,
+#         stop_sequences=["<|im_end|>", "<end_of_turn>"],
+#     )
+
+#     # reset
+#     cactus_reset(model)
+
+#     try:
+#         raw = json.loads(raw_str)
+#         local = {
+#             "function_calls": raw.get("function_calls", []),
+#             "total_time_ms": raw.get("total_time_ms", 0),
+#             "confidence": raw.get("confidence", 0),
+#         }
+#     except json.JSONDecodeError:
+#         local = {
+#             "function_calls": [],
+#             "total_time_ms": 0,
+#             "confidence": 0,
+#         }
+
+#     if local["confidence"] >= confidence_threshold:
+#         local["source"] = "on-device"
+#         return local
+
+#     cloud = generate_cloud(messages, tools)
+#     cloud["source"] = "cloud (fallback)"
+#     cloud["local_confidence"] = local["confidence"]
+#     cloud["total_time_ms"] += local["total_time_ms"]
+#     return cloud
+
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    # Pre-skip expensive local for complex inputs
-    input_complexity = len(messages[-1]["content"]) + 10 * len(tools or [])
-    if input_complexity > 150:
-        cloud = generate_cloud(messages, tools)
-        cloud["source"] = "cloud (pre-skip complex)"
-        return cloud
-    
-    local = generate_cactus(messages, tools)
-    
-    # Adaptive trust: lower bar for simple/fast cases
-    effective_thresh = confidence_threshold
-    if len(tools or []) <= 1:
-        effective_thresh *= 0.85
-    if local["total_time_ms"] < 150:
-        effective_thresh *= 0.9
-    
-    # Trust local if confidence OK OR produced plausible tool calls
-    plausible_calls = bool(local["function_calls"]) and any(
-        call.get("name") in [t["name"] for t in tools or []] 
-        for call in local["function_calls"][:2]  # Check first 2
+    # cache the local model
+    if not hasattr(generate_hybrid, "_model"):
+        generate_hybrid._model = cactus_init(functiongemma_path)
+
+    model = generate_hybrid._model
+
+    cactus_tools = [{"type": "function", "function": t} for t in tools]
+
+    raw_str = cactus_complete(
+        model,
+        [{"role": "system", "content": "You are a helpful assistant that can use tools."}] + messages,
+        tools=cactus_tools,
+        force_tools=True,
+        max_tokens=256,
+        stop_sequences=["<|im_end|>", "<end_of_turn>"],
     )
-    
-    if local["confidence"] >= effective_thresh or plausible_calls:
-        local["source"] = "on-device (hybrid trust)"
+
+    # reset state
+    cactus_reset(model)
+
+    try:
+        raw = json.loads(raw_str)
+        local = {
+            "function_calls": raw.get("function_calls", []),
+            "total_time_ms": raw.get("total_time_ms", 0),
+            "confidence": raw.get("confidence", 0),
+        }
+    except json.JSONDecodeError:
+        local = {
+            "function_calls": [],
+            "total_time_ms": 0,
+            "confidence": 0,
+        }
+    tool_by_name = {t.get("name"): t for t in tools}
+
+    def _type_ok(val, json_type: str) -> bool:
+        if json_type == "string":
+            return isinstance(val, str)
+        if json_type == "integer":
+            return isinstance(val, int) and not isinstance(val, bool)
+        if json_type == "number":
+            return (isinstance(val, (int, float)) and not isinstance(val, bool))
+        if json_type == "boolean":
+            return isinstance(val, bool)
+        if json_type == "object":
+            return isinstance(val, dict)
+        if json_type == "array":
+            return isinstance(val, list)
+        return False
+
+    def _call_valid(call: dict) -> bool:
+        name = call.get("name")
+        if not name or name not in tool_by_name:
+            return False
+
+        args = call.get("arguments", {})
+        if not isinstance(args, dict):
+            return False
+
+        schema = tool_by_name[name].get("parameters", {})
+        props = schema.get("properties", {}) or {}
+        required = schema.get("required", []) or []
+
+        # required keys must exist
+        for k in required:
+            if k not in args:
+                return False
+
+        # no unknown keys + type checks
+        for k, v in args.items():
+            if k not in props:
+                return False
+            expected_type = (props[k].get("type") or "").lower()
+            if expected_type and not _type_ok(v, expected_type):
+                return False
+
+        return True
+
+    local_calls = local.get("function_calls", [])
+    if local_calls and all(_call_valid(c) for c in local_calls):
+        local["source"] = "on-device"
         return local
-    
-    # Fallback (unchanged except source label)
+
+    # fallback
     cloud = generate_cloud(messages, tools)
-    cloud["source"] = f"cloud (conf={local['confidence']:.2f})"
+    cloud["source"] = "cloud (fallback)"
     cloud["local_confidence"] = local["confidence"]
     cloud["total_time_ms"] += local["total_time_ms"]
     return cloud
-
 
 
 def print_result(label, result):
@@ -138,7 +241,8 @@ def print_result(label, result):
     if "confidence" in result:
         print(f"Confidence: {result['confidence']:.4f}")
     if "local_confidence" in result:
-        print(f"Local confidence (below threshold): {result['local_confidence']:.4f}")
+        print(
+            f"Local confidence (below threshold): {result['local_confidence']:.4f}")
     print(f"Total time: {result['total_time_ms']:.2f}ms")
     for call in result["function_calls"]:
         print(f"Function: {call['name']}")
