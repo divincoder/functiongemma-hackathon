@@ -74,7 +74,7 @@ def generate_cloud(messages, tools):
     ]
     # Add steering hint to encourage completeness and format (Gemini expects roles user/model).
     contents.insert(0, types.Content(role="user", parts=[types.Part(
-        text="Instruction: Return function_calls array with one entry per requested action. Use only provided tools. No prose."
+        text="Instruction: Return function_calls with one entry per requested action. Use only provided tools. Extract argument values directly from the user's message — use short, exact values as they appear in the text. No prose."
     )]))
 
     start_time = time.time()
@@ -121,7 +121,7 @@ def _on_device_call(messages, tools, tool_rag_top_k=None, extra_system=None, tem
     cactus_reset(model)
 
     cactus_tools = [{"type": "function", "function": t} for t in tools]
-    system_prompt = "You are a helpful assistant that can use tools."
+    system_prompt = "You are a tool-calling assistant. Respond with exactly one function call in correct JSON format. Extract argument values directly from the user's message — use short, exact values, not paraphrases. No prose."
     if extra_system:
         system_prompt += " " + extra_system
     kwargs = dict(
@@ -155,26 +155,18 @@ def _on_device_call(messages, tools, tool_rag_top_k=None, extra_system=None, tem
 
 
 def _fix_args(calls, tools):
-    """Coerce argument types toward tool schemas to reduce invalid calls."""
+    """Schema-driven argument coercion — no tool-specific logic."""
     tool_map = {t["name"]: t for t in tools}
-
-    def _clean_reminder_title(text):
-        if not isinstance(text, str):
-            return text
-        lower = text.lower()
-        # Extract between about/to ... at ... if present
-        import re
-        m = re.search(r"(?:about|to) (.+?) at ", lower)
-        if m:
-            return m.group(1).strip()
-        m = re.search(r"(?:about|to) (.+)", lower)
-        if m:
-            return m.group(1).strip()
-        return text.strip()
 
     def _coerce(prop, value):
         ptype = prop.get("type")
         if ptype == "integer":
+            # Handle time-like strings ("7:30" → 7) and numeric strings
+            if isinstance(value, str) and ":" in value:
+                try:
+                    return abs(int(value.split(":")[0].strip()))
+                except (ValueError, IndexError):
+                    pass
             try:
                 return abs(int(float(value)))
             except (ValueError, TypeError):
@@ -194,6 +186,11 @@ def _fix_args(calls, tools):
                 if lower in ["false", "no", "0"]:
                     return False
             return value
+        if ptype == "string" and isinstance(value, str):
+            # Strip surrounding quotes, trailing punctuation, and whitespace
+            cleaned = value.strip().strip('"').strip("'").strip()
+            cleaned = cleaned.rstrip(".")
+            return cleaned
         # Enum coercion: case-insensitive match
         if "enum" in prop and isinstance(value, str):
             for option in prop["enum"]:
@@ -201,45 +198,53 @@ def _fix_args(calls, tools):
                     return option
         return value
 
-    def _strip_articles(text):
-        for prefix in ["the ", "a ", "an ", "my "]:
-            if text.startswith(prefix):
-                return text[len(prefix):]
-        return text
-
-    def _strip_time_suffix(text):
-        import re
-        return re.sub(r"\\s+at\\s+\\d{1,2}(:\\d{2})?\\s*(am|pm)?", "", text, flags=re.IGNORECASE).strip()
-
-    def _strip_punct(text):
-        import re
-        return re.sub(r"[\\.,;:!]+$", "", text).strip()
-
     for call in calls:
-        if call.get("name") in tool_map:
-            props = tool_map[call["name"]]["parameters"].get("properties", {})
-            for k, v in list(call.get("arguments", {}).items()):
-                if k in props:
-                    call["arguments"][k] = _coerce(props[k], v)
-            # Reminder title cleanup for better exact-match
-            if call.get("name") == "create_reminder" and "title" in call.get("arguments", {}):
-                title = _clean_reminder_title(call["arguments"]["title"])
-                if isinstance(title, str):
-                    title = _strip_articles(_strip_time_suffix(_strip_punct(title.strip().lower())))
-                call["arguments"]["title"] = title
+        name = call.get("name", "")
+        if name not in tool_map:
+            continue
+        schema = tool_map[name]["parameters"]
+        props = schema.get("properties", {})
+        args = call.get("arguments", {})
+
+        # Coerce existing arguments by schema type
+        for k, v in list(args.items()):
+            if k in props:
+                args[k] = _coerce(props[k], v)
+
+        # Fill missing required args that have a default in the schema
+        for req in schema.get("required", []):
+            if req not in args and req in props:
+                default = props[req].get("default")
+                if default is not None:
+                    args[req] = default
 
 
 def _valid_calls(calls, tools):
-    """Check all function calls have valid names and required params."""
+    """Check all function calls have valid names, required params, and correct types."""
+    type_check = {
+        "string": lambda v: isinstance(v, str),
+        "integer": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+        "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+        "boolean": lambda v: isinstance(v, bool),
+    }
     tool_map = {t["name"]: t for t in tools}
     for call in calls:
         name = call.get("name", "")
         if name not in tool_map:
             return False
-        required = tool_map[name]["parameters"].get("required", [])
+        schema = tool_map[name]["parameters"]
+        required = schema.get("required", [])
+        props = schema.get("properties", {})
         args = call.get("arguments", {})
         if any(r not in args for r in required):
             return False
+        # Validate argument types against schema
+        for k, v in args.items():
+            if k in props:
+                expected_type = props[k].get("type")
+                checker = type_check.get(expected_type)
+                if checker and not checker(v):
+                    return False
     return True
 
 
@@ -258,7 +263,8 @@ def _has_all_required(calls, tools):
 
 
 def _split_actions(text):
-    """Split a multi-action query into individual action segments."""
+    """Split a multi-action query into individual action segments with pronoun resolution."""
+    import re
     if ", and " in text:
         last_split = text.rsplit(", and ", 1)
         segments = last_split[0].split(", ")
@@ -267,7 +273,37 @@ def _split_actions(text):
         segments = text.split(" and ")
     else:
         segments = [text]
-    return [s.strip().rstrip(".") for s in segments if len(s.strip()) > 3]
+    segments = [s.strip().rstrip(".") for s in segments if len(s.strip()) > 3]
+
+    # Lightweight coreference resolution: carry forward proper nouns
+    last_person = None
+    last_location = None
+    resolved = []
+    for seg in segments:
+        # Extract person name (capitalized word after common prepositions/verbs)
+        person_match = re.search(
+            r"(?:to|from|for|text|message|call|find|look up|search for|contact)\s+([A-Z][a-z]+)",
+            seg,
+        )
+        if person_match:
+            last_person = person_match.group(1)
+
+        # Extract location (capitalized words after "in")
+        loc_match = re.search(r"\bin\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", seg)
+        if loc_match:
+            last_location = loc_match.group(1)
+
+        # Resolve pronouns using previously extracted entities
+        if last_person:
+            seg = re.sub(r"\bhim\b", last_person, seg, flags=re.IGNORECASE)
+            seg = re.sub(r"\bher\b", last_person, seg, flags=re.IGNORECASE)
+            seg = re.sub(r"\bthem\b", last_person, seg, flags=re.IGNORECASE)
+        if last_location:
+            seg = re.sub(r"\bthere\b", f"in {last_location}", seg, flags=re.IGNORECASE)
+
+        resolved.append(seg)
+
+    return resolved
 
 
 def _is_multi_action(text):
@@ -283,17 +319,43 @@ def generate_hybrid(messages, tools, confidence_threshold=0.7):
     multi = _is_multi_action(user_text) and len(tools) > 1
     segments = _split_actions(user_text) if multi else None
 
-    # Multi-action fallback: decompose into single-action sub-queries
+    # Adaptive temperature based on tool count
+    base_temp = 0.01 if len(tools) == 1 else 0.10 if len(tools) <= 3 else 0.20
+    tool_names = ", ".join(t["name"] for t in tools)
+
+    # ==== MULTI-ACTION PATH ====
     if multi:
+        # Quick attempt: try whole query on-device in one shot (only for 2-segment)
+        if len(segments) == 2:
+            whole = _on_device_call(
+                messages,
+                tools,
+                tool_rag_top_k=0,
+                extra_system=f"Return ALL requested function calls. Available tools: {tool_names}. Fill all required arguments for each call. No prose.",
+                temperature=0.2,
+            )
+            _fix_args(whole["function_calls"], tools)
+            if (
+                whole["function_calls"]
+                and len(whole["function_calls"]) >= 2
+                and _valid_calls(whole["function_calls"], tools)
+                and _has_all_required(whole["function_calls"], tools)
+            ):
+                return {
+                    "function_calls": whole["function_calls"],
+                    "total_time_ms": (time.time() - start) * 1000,
+                    "source": "on-device",
+                }
+
+        # Segment-by-segment decomposition with context
         all_calls = []
         all_ok = True
-        missing_segments = []
         for segment in segments:
             sub = _on_device_call(
                 [{"role": "user", "content": segment}],
                 tools,
                 tool_rag_top_k=0,
-                extra_system=f"Available tools: {', '.join(t['name'] for t in tools)}. Use exactly one tool call that best satisfies this single instruction. Fill all required arguments. No prose.",
+                extra_system=f"Original request: '{user_text}'. Available tools: {tool_names}. Handle ONLY this sub-task: '{segment}'. Use exactly one tool call. Fill all required arguments. No prose.",
                 temperature=0.2,
             )
             _fix_args(sub["function_calls"], tools)
@@ -301,37 +363,44 @@ def generate_hybrid(messages, tools, confidence_threshold=0.7):
                 all_calls.extend(sub["function_calls"])
             else:
                 all_ok = False
-                missing_segments.append(segment)
+
         if all_ok and all_calls and len(all_calls) >= len(segments) and _has_all_required(all_calls, tools):
             return {
                 "function_calls": all_calls,
                 "total_time_ms": (time.time() - start) * 1000,
                 "source": "on-device",
             }
-        # Partial success: try cloud to fill missing intents, merge results with distinctness
-        if all_calls and missing_segments:
-            cloud_partial = generate_cloud(messages, tools)
-            _fix_args(cloud_partial["function_calls"], tools)
-            merged = all_calls.copy()
-            for c in cloud_partial["function_calls"]:
-                if not any((c.get("name")==m.get("name") and c.get("arguments")==m.get("arguments")) for m in merged):
+
+        # Single cloud call, merge with any on-device successes
+        cloud = generate_cloud(messages, tools)
+        _fix_args(cloud["function_calls"], tools)
+        if all_calls:
+            merged = list(all_calls)
+            on_device_names = {c.get("name") for c in all_calls}
+            for c in cloud["function_calls"]:
+                if c.get("name") not in on_device_names:
                     merged.append(c)
             if _valid_calls(merged, tools) and _has_all_required(merged, tools) and len(merged) >= len(segments):
                 return {
                     "function_calls": merged,
                     "total_time_ms": (time.time() - start) * 1000,
-                    "source": "hybrid-merge",
+                    "source": "on-device",
                 }
-        # If still missing, fall back to cloud directly for multi-action
-        cloud = generate_cloud(messages, tools)
-        _fix_args(cloud["function_calls"], tools)
+
         cloud["source"] = "cloud (fallback)"
         cloud["total_time_ms"] = (time.time() - start) * 1000
-        cloud["local_confidence"] = 0
         return cloud
 
-    # Single-intent path: one fast local try, then cloud based on confidence
-    result = _on_device_call(messages, tools, tool_rag_top_k=None)
+    # ==== SINGLE-INTENT PATH (max 2 on-device attempts) ====
+
+    # Attempt 1: Focused call with tool guidance
+    result = _on_device_call(
+        messages,
+        tools,
+        tool_rag_top_k=min(2, len(tools)),
+        extra_system=f"Available tools: {tool_names}. Pick the most relevant tool. Fill all required arguments. No prose.",
+        temperature=base_temp,
+    )
     _fix_args(result["function_calls"], tools)
 
     if result["function_calls"] and _valid_calls(result["function_calls"], tools):
@@ -341,53 +410,37 @@ def generate_hybrid(messages, tools, confidence_threshold=0.7):
             "source": "on-device",
         }
 
-    # If only one tool is available and local failed or was low confidence, defer to cloud for generality.
-    if len(tools) == 1 and result.get("confidence", 0) < 1.0:
-        cloud = generate_cloud(messages, tools)
-        _fix_args(cloud["function_calls"], tools)
-        cloud["source"] = "cloud (fallback)"
-        cloud["total_time_ms"] = (time.time() - start) * 1000
-        cloud["local_confidence"] = result.get("confidence", 0)
-        return cloud
-
-    # Narrowed retry for ambiguous single-intent tool choice
-    narrowed_retry = _on_device_call(
-        messages,
-        tools,
-        tool_rag_top_k=min(2, len(tools)),
-        extra_system="Select the single best tool and return one valid function call with all required arguments. No prose.",
-        temperature=0.35,
-    )
-    _fix_args(narrowed_retry["function_calls"], tools)
-    if narrowed_retry["function_calls"] and _valid_calls(narrowed_retry["function_calls"], tools):
-        return {
-            "function_calls": narrowed_retry["function_calls"],
-            "total_time_ms": (time.time() - start) * 1000,
-            "source": "on-device",
-        }
-
-    if result.get("confidence", 0) >= confidence_threshold:
+    # Attempt 2: all tools visible, different temperature
+    if len(tools) == 1:
         retry = _on_device_call(
             messages,
             tools,
             tool_rag_top_k=0,
-            extra_system="Always reply with a single function call JSON using only provided tools and all required arguments. No prose.",
-            temperature=0.2,
+            extra_system=f"You MUST call '{tools[0]['name']}' with all required arguments. No prose.",
+            temperature=0.1,
         )
-        _fix_args(retry["function_calls"], tools)
-        if retry["function_calls"] and _valid_calls(retry["function_calls"], tools):
-            return {
-                "function_calls": retry["function_calls"],
-                "total_time_ms": (time.time() - start) * 1000,
-                "source": "on-device",
-            }
+    else:
+        retry = _on_device_call(
+            messages,
+            tools,
+            tool_rag_top_k=0,
+            extra_system=f"Available tools: {tool_names}. Use the most relevant tool. Fill all required arguments. No prose.",
+            temperature=min(base_temp + 0.15, 0.35),
+        )
+    _fix_args(retry["function_calls"], tools)
 
+    if retry["function_calls"] and _valid_calls(retry["function_calls"], tools):
+        return {
+            "function_calls": retry["function_calls"],
+            "total_time_ms": (time.time() - start) * 1000,
+            "source": "on-device",
+        }
+
+    # Cloud fallback
     cloud = generate_cloud(messages, tools)
     _fix_args(cloud["function_calls"], tools)
     cloud["source"] = "cloud (fallback)"
     cloud["total_time_ms"] = (time.time() - start) * 1000
-    cloud["local_confidence"] = result.get("confidence", 0)
-
     return cloud
 
 
