@@ -95,18 +95,39 @@ def generate_cloud(messages, tools):
 
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    """Baseline hybrid inference strategy; fall back to cloud if Cactus Confidence is below threshold."""
+    # Pre-skip expensive local for complex inputs
+    input_complexity = len(messages[-1]["content"]) + 10 * len(tools or [])
+    if input_complexity > 150:
+        cloud = generate_cloud(messages, tools)
+        cloud["source"] = "cloud (pre-skip complex)"
+        return cloud
+    
     local = generate_cactus(messages, tools)
-
-    if local["confidence"] >= confidence_threshold:
-        local["source"] = "on-device"
+    
+    # Adaptive trust: lower bar for simple/fast cases
+    effective_thresh = confidence_threshold
+    if len(tools or []) <= 1:
+        effective_thresh *= 0.85
+    if local["total_time_ms"] < 150:
+        effective_thresh *= 0.9
+    
+    # Trust local if confidence OK OR produced plausible tool calls
+    plausible_calls = bool(local["function_calls"]) and any(
+        call.get("name") in [t["name"] for t in tools or []] 
+        for call in local["function_calls"][:2]  # Check first 2
+    )
+    
+    if local["confidence"] >= effective_thresh or plausible_calls:
+        local["source"] = "on-device (hybrid trust)"
         return local
-
+    
+    # Fallback (unchanged except source label)
     cloud = generate_cloud(messages, tools)
-    cloud["source"] = "cloud (fallback)"
+    cloud["source"] = f"cloud (conf={local['confidence']:.2f})"
     cloud["local_confidence"] = local["confidence"]
     cloud["total_time_ms"] += local["total_time_ms"]
     return cloud
+
 
 
 def print_result(label, result):
