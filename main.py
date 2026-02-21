@@ -4,7 +4,7 @@ sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
 import json, os, time
-from cactus import cactus_init, cactus_complete, cactus_destroy
+from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
 from google import genai
 from google.genai import types
 
@@ -94,18 +94,142 @@ def generate_cloud(messages, tools):
     }
 
 
+############## Hybrid Routing ##############
+
+# Warm model: load once, reuse across calls
+_warm_model = None
+
+
+def _get_model():
+    global _warm_model
+    if _warm_model is None:
+        _warm_model = cactus_init(functiongemma_path)
+    return _warm_model
+
+
+def _on_device_call(messages, tools, tool_rag_top_k=None):
+    """Run a single on-device inference using the warm model."""
+    model = _get_model()
+    cactus_reset(model)
+
+    cactus_tools = [{"type": "function", "function": t} for t in tools]
+    kwargs = dict(
+        force_tools=True,
+        max_tokens=512,
+        stop_sequences=["<|im_end|>", "<end_of_turn>"],
+        confidence_threshold=0.01,
+    )
+    if tool_rag_top_k is not None:
+        kwargs["tool_rag_top_k"] = tool_rag_top_k
+
+    raw_str = cactus_complete(
+        model,
+        [{"role": "system", "content": "You are a helpful assistant that can use tools."}] + messages,
+        tools=cactus_tools,
+        **kwargs,
+    )
+
+    try:
+        raw = json.loads(raw_str)
+    except json.JSONDecodeError:
+        return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
+
+    return {
+        "function_calls": raw.get("function_calls", []),
+        "total_time_ms": raw.get("total_time_ms", 0),
+        "confidence": raw.get("confidence", 0),
+    }
+
+
+def _fix_args(calls, tools):
+    """Fix integer types and negative values in function call arguments."""
+    tool_map = {t["name"]: t for t in tools}
+    for call in calls:
+        if call.get("name") in tool_map:
+            props = tool_map[call["name"]]["parameters"].get("properties", {})
+            for k, v in list(call.get("arguments", {}).items()):
+                if k in props and props[k].get("type") == "integer":
+                    try:
+                        call["arguments"][k] = abs(int(float(v)))
+                    except (ValueError, TypeError):
+                        pass
+
+
+def _valid_calls(calls, tools):
+    """Check all function calls have valid names and required params."""
+    tool_map = {t["name"]: t for t in tools}
+    for call in calls:
+        name = call.get("name", "")
+        if name not in tool_map:
+            return False
+        required = tool_map[name]["parameters"].get("required", [])
+        args = call.get("arguments", {})
+        if any(r not in args for r in required):
+            return False
+    return True
+
+
+def _split_actions(text):
+    """Split a multi-action query into individual action segments."""
+    if ", and " in text:
+        last_split = text.rsplit(", and ", 1)
+        segments = last_split[0].split(", ")
+        segments.append(last_split[1])
+    elif " and " in text:
+        segments = text.split(" and ")
+    else:
+        segments = [text]
+    return [s.strip().rstrip(".") for s in segments if len(s.strip()) > 3]
+
+
+def _is_multi_action(text):
+    """Check if text likely contains multiple action requests."""
+    lower = text.lower()
+    return " and " in lower or lower.count(",") > 1
+
+
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    """Baseline hybrid inference strategy; fall back to cloud if Cactus Confidence is below threshold."""
-    local = generate_cactus(messages, tools)
+    """Hybrid inference: on-device with structural validation, cloud fallback."""
+    start = time.time()
+    user_text = " ".join(m["content"] for m in messages if m["role"] == "user")
+    multi = _is_multi_action(user_text) and len(tools) > 1
 
-    if local["confidence"] >= confidence_threshold:
-        local["source"] = "on-device"
-        return local
+    # Try on-device natively (disable tool RAG for multi-action so model sees all tools)
+    result = _on_device_call(messages, tools, tool_rag_top_k=0 if multi else None)
+    _fix_args(result["function_calls"], tools)
 
+    if result["function_calls"] and _valid_calls(result["function_calls"], tools):
+        return {
+            "function_calls": result["function_calls"],
+            "total_time_ms": (time.time() - start) * 1000,
+            "source": "on-device",
+        }
+
+    # Multi-action fallback: decompose into single-action sub-queries
+    if multi:
+        segments = _split_actions(user_text)
+        all_calls = []
+        all_ok = True
+        for segment in segments:
+            sub = _on_device_call([{"role": "user", "content": segment}], tools)
+            _fix_args(sub["function_calls"], tools)
+            if sub["function_calls"] and _valid_calls(sub["function_calls"], tools):
+                all_calls.extend(sub["function_calls"])
+            else:
+                all_ok = False
+                break
+        if all_ok and all_calls:
+            return {
+                "function_calls": all_calls,
+                "total_time_ms": (time.time() - start) * 1000,
+                "source": "on-device",
+            }
+
+    # Cloud fallback
     cloud = generate_cloud(messages, tools)
+    _fix_args(cloud["function_calls"], tools)
     cloud["source"] = "cloud (fallback)"
-    cloud["local_confidence"] = local["confidence"]
-    cloud["total_time_ms"] += local["total_time_ms"]
+    cloud["total_time_ms"] = (time.time() - start) * 1000
     return cloud
 
 
