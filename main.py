@@ -1,12 +1,13 @@
 
+import time
+import os
+import json
+from google.genai import types
+from google import genai
+from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
 import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
-
-import json, os, time
-from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
-from google import genai
-from google.genai import types
 
 
 def generate_cactus(messages, tools):
@@ -65,7 +66,8 @@ def generate_cloud(messages, tools):
                 parameters=types.Schema(
                     type="OBJECT",
                     properties={
-                        k: types.Schema(type=v["type"].upper(), description=v.get("description", ""))
+                        k: types.Schema(type=v["type"].upper(
+                        ), description=v.get("description", ""))
                         for k, v in t["parameters"]["properties"].items()
                     },
                     required=t["parameters"].get("required", []),
@@ -81,7 +83,8 @@ def generate_cloud(messages, tools):
         role = m.get("role", "user")
         if role not in ("user", "model"):
             role = "user"
-        contents.append(types.Content(role=role, parts=[types.Part(text=m["content"])]))
+        contents.append(types.Content(role=role, parts=[
+                        types.Part(text=m["content"])]))
     # Add steering hint to encourage completeness and format (Gemini expects roles user/model).
     contents.insert(0, types.Content(role="user", parts=[types.Part(
         text="Instruction: Return function_calls array with one entry per requested action. Use only provided tools. No prose."
@@ -235,7 +238,8 @@ def _fix_args(calls, tools):
             if call.get("name") == "create_reminder" and "title" in call.get("arguments", {}):
                 title = _clean_reminder_title(call["arguments"]["title"])
                 if isinstance(title, str):
-                    title = _strip_articles(_strip_time_suffix(_strip_punct(title.strip().lower())))
+                    title = _strip_articles(_strip_time_suffix(
+                        _strip_punct(title.strip().lower())))
                 call["arguments"]["title"] = title
 
 
@@ -267,8 +271,24 @@ def _has_all_required(calls, tools):
     return True
 
 
+# def _split_actions(text):
+#     """Split a multi-action query into individual action segments."""
+#     if ", and " in text:
+#         last_split = text.rsplit(", and ", 1)
+#         segments = last_split[0].split(", ")
+#         segments.append(last_split[1])
+#     elif " and " in text:
+#         segments = text.split(" and ")
+#     else:
+#         segments = [text]
+#     return [s.strip().rstrip(".") for s in segments if len(s.strip()) > 3]
+
 def _split_actions(text):
-    """Split a multi-action query into individual action segments."""
+    import re
+    # split on "and then", "then", or "and" with punctuation boundaries too
+    text = re.sub(r"\.\s*(and\s+then|then)\s+",
+                  " and ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\.\s+", " and ", text)  # period can separate commands
     if ", and " in text:
         last_split = text.rsplit(", and ", 1)
         segments = last_split[0].split(", ")
@@ -286,10 +306,26 @@ def _is_multi_action(text):
     return " and " in lower or lower.count(",") > 1
 
 
+def _normalize_user_text(text: str) -> str:
+    import re
+    t = text.strip()
+    t = t.replace("\n", " ")
+    t = re.sub(r"\s+", " ", t)                  # collapse whitespace
+    t = t.replace(";", ".")                     # normalize separators
+    t = re.sub(r"\.{2,}", ".", t)               # "..." -> "."
+    t = re.sub(r"\s*\.\s*", ". ", t).strip()    # normalize dot spacing
+    t = re.sub(r"\s*,\s*", ", ", t)             # normalize commas
+    # Make "then" a reliable separator for multi-action
+    t = re.sub(r"\bthen\b", "and then", t, flags=re.IGNORECASE)
+    return t
+
+
 def generate_hybrid(messages, tools, confidence_threshold=0.7):
     """Hybrid inference: on-device with structural validation, cloud fallback."""
     start = time.time()
-    user_text = " ".join(m["content"] for m in messages if m["role"] == "user")
+    # user_text = " ".join(m["content"] for m in messages if m["role"] == "user")
+    user_text = _normalize_user_text(
+        " ".join(m["content"] for m in messages if m["role"] == "user"))
     multi = _is_multi_action(user_text) and len(tools) > 1
     segments = _split_actions(user_text) if multi else None
 
@@ -324,7 +360,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.7):
             _fix_args(cloud_partial["function_calls"], tools)
             merged = all_calls.copy()
             for c in cloud_partial["function_calls"]:
-                if not any((c.get("name")==m.get("name") and c.get("arguments")==m.get("arguments")) for m in merged):
+                if not any((c.get("name") == m.get("name") and c.get("arguments") == m.get("arguments")) for m in merged):
                     merged.append(c)
             if _valid_calls(merged, tools) and _has_all_required(merged, tools) and len(merged) >= len(segments):
                 return {
@@ -409,7 +445,8 @@ def print_result(label, result):
     if "confidence" in result:
         print(f"Confidence: {result['confidence']:.4f}")
     if "local_confidence" in result:
-        print(f"Local confidence (below threshold): {result['local_confidence']:.4f}")
+        print(
+            f"Local confidence (below threshold): {result['local_confidence']:.4f}")
     print(f"Total time: {result['total_time_ms']:.2f}ms")
     for call in result["function_calls"]:
         print(f"Function: {call['name']}")
