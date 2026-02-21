@@ -95,39 +95,55 @@ def generate_cloud(messages, tools):
 
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    # Pre-skip expensive local for complex inputs
-    input_complexity = len(messages[-1]["content"]) + 10 * len(tools or [])
-    if input_complexity > 150:
-        cloud = generate_cloud(messages, tools)
-        cloud["source"] = "cloud (pre-skip complex)"
-        return cloud
-    
+    # 1. Run On-Device Model
     local = generate_cactus(messages, tools)
     
-    # Adaptive trust: lower bar for simple/fast cases
-    effective_thresh = confidence_threshold
-    if len(tools or []) <= 1:
-        effective_thresh *= 0.85
-    if local["total_time_ms"] < 150:
-        effective_thresh *= 0.9
+    # 2. Strict Schema Validation
+    # We only trust the local model if it follows the instructions perfectly.
+    is_valid_schema = False
+    has_calls = len(local.get("function_calls", [])) > 0
     
-    # Trust local if confidence OK OR produced plausible tool calls
-    plausible_calls = bool(local["function_calls"]) and any(
-        call.get("name") in [t["name"] for t in tools or []] 
-        for call in local["function_calls"][:2]  # Check first 2
-    )
-    
-    if local["confidence"] >= effective_thresh or plausible_calls:
-        local["source"] = "on-device (hybrid trust)"
-        return local
-    
-    # Fallback (unchanged except source label)
-    cloud = generate_cloud(messages, tools)
-    cloud["source"] = f"cloud (conf={local['confidence']:.2f})"
-    cloud["local_confidence"] = local["confidence"]
-    cloud["total_time_ms"] += local["total_time_ms"]
-    return cloud
+    if has_calls and tools:
+        tool_map = {t["name"]: t for t in tools}
+        all_calls_valid = True
+        
+        for call in local["function_calls"]:
+            func_name = call.get("name")
+            args = call.get("arguments", {})
+            
+            # Check A: Does the tool actually exist?
+            if func_name not in tool_map:
+                all_calls_valid = False
+                break
+            
+            # Check B: Are all REQUIRED parameters present?
+            # This catches the F1=0.0 errors where the model forgets args
+            required_params = tool_map[func_name]["parameters"].get("required", [])
+            if any(req not in args for req in required_params):
+                all_calls_valid = False
+                break
+        
+        is_valid_schema = all_calls_valid
 
+    # 3. Decision Logic
+    # If schema is valid, we lower the bar. FunctionGemma is often right but underconfident.
+    # We trust it at 0.40 confidence IF the JSON schema is perfect.
+    if is_valid_schema and local.get("confidence", 0) >= 0.4:
+        local["source"] = "on-device (verified)"
+        local["cloud_handoff"] = False  # <--- CRITICAL FOR SCORE
+        return local
+        
+    # 4. Cloud Fallback
+    # If validation failed or confidence is garbage, go to Gemini.
+    cloud = generate_cloud(messages, tools)
+    
+    # Add metrics for debugging
+    cloud["source"] = f"cloud (fallback, local_conf={local.get('confidence', 0):.2f})"
+    cloud["local_confidence"] = local.get("confidence", 0)
+    cloud["total_time_ms"] += local.get("total_time_ms", 0) # Penalty for trying local first
+    cloud["cloud_handoff"] = True   # <--- CRITICAL FOR SCORE
+    
+    return cloud
 
 
 def print_result(label, result):
